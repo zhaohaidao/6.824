@@ -59,7 +59,7 @@ func (mr *MapReduce) RunMaster() *list.List {
 			if ok == false {
 				fmt.Printf("DoWork: RPC %s dojob error\n", mr.Workers[worker])
 				log.Println("job failed, and re-assign work to other workers, failed worker: " + worker)
-				mr.Workers[worker].state = InValid
+				mr.Workers[worker].UpdateState(InValid)
 				jobNumberChan <- ch
 				return
 			}
@@ -81,7 +81,7 @@ func (mr *MapReduce) RunMaster() *list.List {
 					go workerExec(m.address, mr.file, jobType, jobChan, numOtherPhase, &wg)
 				}
 			}
-//			time.Sleep(1 * time.Second)
+			time.Sleep(1 * time.Second)
 		}
 
 		defer close(jobChan)
