@@ -7,7 +7,10 @@ import "time"
 import "sync"
 import "fmt"
 import "os"
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"errors"
+)
 
 type ViewServer struct {
 	mu       sync.Mutex
@@ -18,6 +21,11 @@ type ViewServer struct {
 
 
 	// Your declarations here.
+	currentView View
+	ackedViewNum uint
+	visitRecord map[string]time.Time
+
+
 }
 
 //
@@ -25,7 +33,54 @@ type ViewServer struct {
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
+	if args.Me != "" {
+		vs.visitRecord[args.Me] = time.Now()
+	}
+
 	// Your code here.
+	if args.Me == vs.currentView.Primary && vs.currentView.Viewnum == args.Viewnum {
+		vs.ackedViewNum = vs.currentView.Viewnum
+	}
+
+	if vs.currentView.Viewnum == 0 {
+		if args.Viewnum == vs.currentView.Viewnum {
+			vs.ackedViewNum = 0
+			vs.currentView.Viewnum += 1
+			vs.currentView.Primary = args.Me
+			vs.currentView.Backup = ""
+			reply.View = vs.currentView
+			return nil
+		} else {
+			return errors.New("abnormal VIEWNUM !!!")
+		}
+	}
+
+	if vs.currentView.Backup == "" {
+		if vs.currentView.Primary == args.Me {
+			reply.View = vs.currentView
+			return nil
+		} else {
+			vs.currentView.Backup = args.Me
+			if vs.ackedViewNum == vs.currentView.Viewnum {
+				vs.currentView.Viewnum += 1
+			}
+			reply.View = vs.currentView
+			return nil
+		}
+	}
+
+	if  args.Viewnum == 0 && vs.currentView.Primary == args.Me {
+		if vs.currentView.Primary != "" && vs.currentView.Backup != "" {
+			vs.currentView.Primary = vs.currentView.Backup
+			vs.currentView.Backup = ""
+			if vs.currentView.Viewnum == vs.ackedViewNum {
+				vs.currentView.Viewnum += 1
+			}
+		}
+
+	}
+
+	reply.View = vs.currentView
 
 	return nil
 }
@@ -36,6 +91,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
+	reply.View = vs.currentView
 
 	return nil
 }
@@ -49,6 +105,38 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 func (vs *ViewServer) tick() {
 
 	// Your code here.
+
+	currentView := vs.currentView
+	if currentView.Viewnum > 0 && vs.ackedViewNum == currentView.Viewnum {
+		if currentView.Primary != "" {
+			lastVisitTime, ok := vs.visitRecord[currentView.Primary]
+			if ok {
+				if (time.Now().Sub(lastVisitTime)).Nanoseconds()/int64(PingInterval) > DeadPings {
+					currentView.Primary = ""
+				}
+			}
+
+		}
+
+		if currentView.Backup != "" {
+			lastVisitTime, ok := vs.visitRecord[currentView.Backup]
+			if ok {
+				if (time.Now().Sub(lastVisitTime)).Nanoseconds()/int64(PingInterval)  > DeadPings {
+					currentView.Backup = ""
+				} else if currentView.Primary == "" {
+					currentView.Primary = currentView.Backup
+					currentView.Backup = ""
+				}
+			}
+		}
+		if currentView.Primary != vs.currentView.Primary ||
+		currentView.Backup != vs.currentView.Backup {
+			currentView.Viewnum += 1
+		}
+
+	}
+
+	vs.currentView = currentView
 }
 
 //
@@ -77,6 +165,8 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
+	vs.currentView = View{Viewnum:0, Primary:"", Backup:""}
+	vs.visitRecord = make(map[string]time.Time)
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()

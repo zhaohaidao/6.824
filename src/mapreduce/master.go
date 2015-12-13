@@ -81,7 +81,7 @@ func (mr *MapReduce) RunMaster() *list.List {
 					go workerExec(m.address, mr.file, jobType, jobChan, numOtherPhase, &wg)
 				}
 			}
-			time.Sleep(1 * time.Second)
+			time.Sleep(1 * time.Millisecond)
 		}
 
 		defer close(jobChan)

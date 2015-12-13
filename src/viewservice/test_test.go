@@ -5,11 +5,15 @@ import "runtime"
 import "time"
 import "fmt"
 import "os"
-import "strconv"
+import (
+	"strconv"
+	"log"
+)
 
 func check(t *testing.T, ck *Clerk, p string, b string, n uint) {
 	view, _ := ck.Get()
 	if view.Primary != p {
+		fmt.Println(view.Viewnum)
 		t.Fatalf("wanted primary %v, got %v", p, view.Primary)
 	}
 	if view.Backup != b {
@@ -19,6 +23,7 @@ func check(t *testing.T, ck *Clerk, p string, b string, n uint) {
 		t.Fatalf("wanted viewnum %v, got %v", n, view.Viewnum)
 	}
 	if ck.Primary() != p {
+		fmt.Println(view.Viewnum)
 		t.Fatalf("wanted primary %v, got %v", p, ck.Primary())
 	}
 }
@@ -106,6 +111,7 @@ func Test1(t *testing.T) {
 			ck1.Ping(0)
 			v, _ := ck2.Ping(vx.Viewnum)
 			if v.Primary == ck2.me && v.Backup == ck1.me {
+				log.Println("Backup: " + v.Backup + "\tck1.me: " + ck1.me)
 				break
 			}
 			time.Sleep(PingInterval)
@@ -122,6 +128,7 @@ func Test1(t *testing.T) {
 
 	{
 		vx, _ := ck2.Get()
+		log.Println(vx)
 		ck2.Ping(vx.Viewnum)
 		for i := 0; i < DeadPings*2; i++ {
 			ck3.Ping(0)
@@ -164,6 +171,8 @@ func Test1(t *testing.T) {
 	// set up a view with just 3 as primary,
 	// to prepare for the next test.
 	{
+
+		fmt.Printf("Test: Dead backup is removed from view ...\n")
 		for i := 0; i < DeadPings*3; i++ {
 			vx, _ := ck3.Get()
 			ck3.Ping(vx.Viewnum)
@@ -188,6 +197,7 @@ func Test1(t *testing.T) {
 			ck1.Ping(0)
 			ck3.Ping(vx.Viewnum)
 			v, _ := ck1.Get()
+			fmt.Println(v)
 			if v.Viewnum > vx.Viewnum {
 				break
 			}
@@ -199,6 +209,7 @@ func Test1(t *testing.T) {
 		// let ck3 die. check that ck1 is not promoted.
 		for i := 0; i < DeadPings*3; i++ {
 			v, _ := ck1.Ping(vy.Viewnum)
+
 			if v.Viewnum > vy.Viewnum {
 				break
 			}
