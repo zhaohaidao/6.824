@@ -128,7 +128,6 @@ func Test1(t *testing.T) {
 
 	{
 		vx, _ := ck2.Get()
-		log.Println(vx)
 		ck2.Ping(vx.Viewnum)
 		for i := 0; i < DeadPings*2; i++ {
 			ck3.Ping(0)

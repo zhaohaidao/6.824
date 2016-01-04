@@ -2,15 +2,19 @@ package pbservice
 
 import "viewservice"
 import "net/rpc"
-import "fmt"
 
 import "crypto/rand"
-import "math/big"
+import (
+	"math/big"
+	"time"
+)
 
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	isPDead bool
+	primary string
 }
 
 // this may come in handy.
@@ -25,6 +29,8 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
+	ck.primary = ck.vs.Primary()
+	ck.isPDead = true
 
 	return ck
 }
@@ -60,7 +66,6 @@ func call(srv string, rpcname string,
 		return true
 	}
 
-	fmt.Println(err)
 	return false
 }
 
@@ -71,19 +76,91 @@ func call(srv string, rpcname string,
 // primary replies with the value or the primary
 // says the key doesn't exist (has never been Put().
 //
+
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	for ck.isPDead {
+		primary := ck.vs.Primary()
+		if primary != "" {
+			ck.isPDead = false
+			ck.primary = primary
+		}
+	}
+	value := ""
 
-	return "???"
+	if !ck.isPDead {
+		args := &GetArgs{}
+		args.Key = key
+		var reply GetReply
+		ok := call(ck.primary, "PBServer.Get", args, &reply)
+		if ok {
+			if reply.Err == OK {
+				value =  reply.Value
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				return ""
+			} else {
+				ck.isPDead = true
+				ck.primary = ""
+				time.Sleep(viewservice.PingInterval)
+				return ck.Get(key)
+			}
+		} else {
+			ck.isPDead = true
+			ck.primary = ""
+			time.Sleep(viewservice.PingInterval)
+			return ck.Get(key)
+		}
+
+	}
+	return value
+
 }
 
 //
 // send a Put or Append RPC
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) PutAppend(key string, value string, op string, randNum int64) {
 
 	// Your code here.
+	// prepare the arguments.
+	for ck.isPDead {
+
+		primary := ck.vs.Primary()
+		if primary != "" {
+			ck.isPDead = false
+			ck.primary = primary
+		}
+	}
+
+	if !ck.isPDead {
+		args := &PutAppendArgs{}
+		args.Key = key
+		args.Value = value
+		args.Op = op
+		args.ReqType = DirectReq
+		args.RandNum = randNum
+		var reply PutAppendReply
+		ok := call(ck.primary, "PBServer.PutAppend", args, &reply)
+		if ok {
+			if reply.Err == OK {
+				return
+			} else if reply.Err == ErrWrongServer {
+				ck.isPDead = true
+				ck.primary = ""
+				time.Sleep(viewservice.PingInterval)
+				ck.PutAppend(key, value, op, randNum)
+			}
+		} else {
+			ck.isPDead = true
+			ck.primary = ""
+			time.Sleep(viewservice.PingInterval)
+			ck.PutAppend(key, value, op, randNum)
+		}
+
+	}
+
 }
 
 //
@@ -91,7 +168,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, "Put", nrand())
 }
 
 //
@@ -99,5 +176,5 @@ func (ck *Clerk) Put(key string, value string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, "Append", nrand())
 }

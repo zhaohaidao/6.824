@@ -4,6 +4,8 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongServer = "ErrWrongServer"
+	DirectReq = "DirectReq"
+	ForwardReq = "ForwardReq"
 )
 
 type Err string
@@ -13,12 +15,23 @@ type PutAppendArgs struct {
 	Key   string
 	Value string
 	// You'll have to add definitions here.
+	Op    string
+	ReqType string
+	RandNum int64
 
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
 
 type PutAppendReply struct {
+	Err Err
+}
+
+type TransferArgs struct {
+	Kv map[string]string
+}
+
+type TransferReply struct {
 	Err Err
 }
 

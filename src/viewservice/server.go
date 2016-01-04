@@ -13,17 +13,17 @@ import (
 )
 
 type ViewServer struct {
-	mu       sync.Mutex
-	l        net.Listener
-	dead     int32 // for testing
-	rpccount int32 // for testing
-	me       string
+	mu           sync.Mutex
+	l            net.Listener
+	dead         int32 // for testing
+	rpccount     int32 // for testing
+	me           string
 
 
-	// Your declarations here.
-	currentView View
+			   // Your declarations here.
+	currentView  View
 	ackedViewNum uint
-	visitRecord map[string]time.Time
+	visitRecord  map[string]time.Time
 
 
 }
@@ -32,12 +32,16 @@ type ViewServer struct {
 // server Ping RPC handler.
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
 	if args.Me != "" {
 		vs.visitRecord[args.Me] = time.Now()
 	}
 
 	// Your code here.
+//	fmt.Printf("args_me: %s, current primary: %s, ping viewnum: %d, ack viewnum: %d\n", args.Me,
+//		vs.currentView.Primary, args.Viewnum, vs.ackedViewNum)
 	if args.Me == vs.currentView.Primary && vs.currentView.Viewnum == args.Viewnum {
 		vs.ackedViewNum = vs.currentView.Viewnum
 	}
@@ -60,8 +64,8 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 			reply.View = vs.currentView
 			return nil
 		} else {
-			vs.currentView.Backup = args.Me
 			if vs.ackedViewNum == vs.currentView.Viewnum {
+				vs.currentView.Backup = args.Me
 				vs.currentView.Viewnum += 1
 			}
 			reply.View = vs.currentView
@@ -69,11 +73,11 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		}
 	}
 
-	if  args.Viewnum == 0 && vs.currentView.Primary == args.Me {
-		if vs.currentView.Primary != "" && vs.currentView.Backup != "" {
-			vs.currentView.Primary = vs.currentView.Backup
-			vs.currentView.Backup = ""
-			if vs.currentView.Viewnum == vs.ackedViewNum {
+	if args.Viewnum == 0 && vs.currentView.Primary == args.Me {
+		if vs.currentView.Viewnum == vs.ackedViewNum {
+			if vs.currentView.Primary != "" && vs.currentView.Backup != "" {
+				vs.currentView.Primary = vs.currentView.Backup
+				vs.currentView.Backup = ""
 				vs.currentView.Viewnum += 1
 			}
 		}
@@ -103,6 +107,8 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 // accordingly.
 //
 func (vs *ViewServer) tick() {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
 	// Your code here.
 
@@ -111,7 +117,7 @@ func (vs *ViewServer) tick() {
 		if currentView.Primary != "" {
 			lastVisitTime, ok := vs.visitRecord[currentView.Primary]
 			if ok {
-				if (time.Now().Sub(lastVisitTime)).Nanoseconds()/int64(PingInterval) > DeadPings {
+				if (time.Now().Sub(lastVisitTime)).Nanoseconds() / int64(PingInterval) > DeadPings {
 					currentView.Primary = ""
 				}
 			}
@@ -121,7 +127,7 @@ func (vs *ViewServer) tick() {
 		if currentView.Backup != "" {
 			lastVisitTime, ok := vs.visitRecord[currentView.Backup]
 			if ok {
-				if (time.Now().Sub(lastVisitTime)).Nanoseconds()/int64(PingInterval)  > DeadPings {
+				if (time.Now().Sub(lastVisitTime)).Nanoseconds() / int64(PingInterval) > DeadPings {
 					currentView.Backup = ""
 				} else if currentView.Primary == "" {
 					currentView.Primary = currentView.Backup

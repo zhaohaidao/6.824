@@ -149,6 +149,7 @@ func TestBasicFail(t *testing.T) {
 	// it does not start serving as primary
 
 	fmt.Printf("Test: Kill last server, new one should not be active ...\n")
+	time.Sleep(viewservice.PingInterval)
 
 	s2.kill()
 	s3 := StartServer(vshost, port(tag, 3))
