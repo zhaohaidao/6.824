@@ -1,2 +1,9 @@
 api.key
 *-handin.tar.gz
+*.iml
+.idea
+src/main/diff.out
+src/mapreduce/*.txt
+src/pbservice/*.txt
+src/kvpaxos/*.txt
+src/pbservice/*.out
