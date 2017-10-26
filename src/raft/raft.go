@@ -28,7 +28,7 @@ import (
 // import "encoding/gob"
 
 const MinimumElectionTimeout = 350
-const MaxmumElectionTimeout = 2 * MinimumElectionTimeout
+const MaximumElectionTimeout = 2 * MinimumElectionTimeout
 const HeartBeatInterval = 100
 
 const (
@@ -315,7 +315,7 @@ func (rf *Raft) electionTimeoutElapse() bool {
 }
 
 func randomElectionTimeout() int {
-	return rand.Intn(MaxmumElectionTimeout - MinimumElectionTimeout) + MinimumElectionTimeout
+	return rand.Intn(MaximumElectionTimeout- MinimumElectionTimeout) + MinimumElectionTimeout
 }
 
 func (rf *Raft) getLastLogIndex() int {
