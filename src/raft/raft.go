@@ -58,8 +58,6 @@ func (e *StateChangeError) Error() string {
 }
 
 
-
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -101,10 +99,9 @@ type Raft struct {
 
 	actor           string
 
-	changedActor chan string
-	resetElectionTimerSignal chan bool
-	startElectionSignal chan bool
-	newCommitIndexCh chan int
+	changedActor       chan string
+	resetElectionTimer chan bool
+	newCommitIndexCh   chan int
 }
 
 // return currentTerm and whether this server
@@ -205,10 +202,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.actor != Follower {
 				rf.convert2State(Follower)
 			} else {
-				rf.resetElectionTimerSignal <- true
+				rf.resetElectionTimer <- true
 			}
 		}
-		if !((rf.getLastLogIndex() >= args.PrevLogIndex) && (args.PrevLogTerm == rf.logs[args.PrevLogIndex].Term)) {
+
+		if rf.getLastLogIndex() < args.PrevLogIndex || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
 			reply.Success = false
 			break
 		}
@@ -326,7 +324,7 @@ func (rf *Raft) handleVoteReply(currentTerm int, reply RequestVoteReply, biggerT
 	}
 }
 
-func (rf *Raft) needUpdateCommitIndex(entryIndex int) bool {
+func (rf *Raft) mayCommit(entryIndex int) bool {
 	if entryIndex <= rf.commitIndex {
 		return false
 	} else {
@@ -384,7 +382,7 @@ func (rf *Raft) getEntries(logs []Log, nextIndex int) []Log {
 	}
 }
 
-func (rf *Raft) appendEntriesReplyHandler(reply *AppendEntriesReply, index int, status Status, entries []Log) {
+func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, status Status, entries []Log) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.actor != Leader {
@@ -407,7 +405,7 @@ func (rf *Raft) appendEntriesReplyHandler(reply *AppendEntriesReply, index int, 
 			newIndex := prevLogIndex + len(entries)
 			rf.nextIndex[index] = newIndex + 1
 			rf.matchIndex[index] = newIndex
-			if rf.needUpdateCommitIndex(newIndex) {
+			if rf.mayCommit(newIndex) {
 				DPrintf("peer replicate from %d to %d. commitIndex update from %d to %d",
 					rf.me, index, rf.commitIndex, newIndex)
 				rf.commitIndex = newIndex
@@ -423,9 +421,14 @@ func (rf *Raft) makeAppendEntriesArgs(status Status) map[int]*AppendEntriesArgs 
 		if index != rf.me {
 			nextIndex := status.nextIndex[index]
 			prevLogIndex := nextIndex - 1
+			DPrintf("peer %d . prevLogIndex: %d", rf.me, prevLogIndex)
 			entries := rf.getEntries(status.logs, status.nextIndex[index])
-			argsMap[index] = &AppendEntriesArgs{Term: status.currentTerm, PrevLogIndex: prevLogIndex,
-				PrevLogTerm: status.logs[prevLogIndex].Term, Entries: entries, LeaderCommit: status.commitIndex}
+			argsMap[index] = &AppendEntriesArgs{
+				Term:         status.currentTerm,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  status.logs[prevLogIndex].Term,
+				Entries:      entries,
+				LeaderCommit: status.commitIndex}
 		}
 	}
 	return argsMap
@@ -448,7 +451,7 @@ func (rf *Raft) sendAppendEntries(ctx context.Context, peerIndex int, status Sta
 	select {
 	case ok := <-rpcOk:
 		if ok {
-			rf.appendEntriesReplyHandler(reply, peerIndex, status, args.Entries)
+			rf.handleAppendEntriesReply(reply, peerIndex, status, args.Entries)
 		}
 		DPrintf("replicate from %d to %d finished", rf.me, peerIndex)
 	case <- ctx.Done():
@@ -616,7 +619,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[index] = len(rf.logs)
 		rf.matchIndex[index] = 0
 	}
-	rf.resetElectionTimerSignal = make(chan bool)
+	rf.resetElectionTimer = make(chan bool)
 	rf.changedActor = make(chan string)
 	rf.newCommitIndexCh = make(chan int)
 
@@ -652,11 +655,11 @@ func (rf *Raft) handleStateChange() {
 		select {
 		case newActor := <- rf.changedActor:
 			if newActor == Leader {
-				go rf.leaderHandler()
+				go rf.onLeader()
 			} else if newActor == Candidate {
-				go rf.candidateHandler()
+				go rf.onCandidate()
 			} else {
-				go rf.followerHandler()
+				go rf.onFollower()
 			}
 		}
 	}
@@ -667,7 +670,7 @@ func (rf *Raft) candidateInitialize() {
 	rf.votedFor = rf.me
 }
 
-func (rf *Raft) candidateHandler() {
+func (rf *Raft) onCandidate() {
 	for {
 		if rf.isCandidate() {
 			rf.mu.Lock()
@@ -676,30 +679,34 @@ func (rf *Raft) candidateHandler() {
 			rf.mu.Unlock()
 			timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
 			err := rf.electWithTimeout(timeout)
-			if err == nil {
-				return
-			} else if _, ok := err.(*ElectionTimeoutError); !ok {
-				DPrintf("peer %d election failed with term %d reason: %s", rf.me, term, err.Error())
-				return
+			if _, ok := err.(*ElectionTimeoutError); ok {
+				DPrintf("peer %d election failed with timeout error. term %d. will start election again", rf.me, term)
 			} else {
-				DPrintf("peer %d election timeout with term %d. will start election again", rf.me, term)
+				if err != nil {
+					DPrintf("peer %d election failed with error: %s. term %d reason: %s", rf.me, err.Error(), term)
+				}
+				break
 			}
 		}
 	}
 }
 
-func (rf *Raft) leaderHandler() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) leaderInitialize() {
 	for index := 0; index < len(rf.peers); index++ {
 		rf.nextIndex[index] = rf.getLastLogIndex() + 1
 		rf.matchIndex[index] = 0
 	}
+}
+
+func (rf *Raft) onLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.leaderInitialize()
 	//rf.append(0)
 	go rf.heartbeat()
 }
 
-func (rf *Raft) followerHandler() {
+func (rf *Raft) onFollower() {
 	for {
 		timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
 		select {
@@ -710,7 +717,7 @@ func (rf *Raft) followerHandler() {
 			rf.convert2State(Candidate)
 			rf.mu.Unlock()
 			return
-		case <-rf.resetElectionTimerSignal:
+		case <-rf.resetElectionTimer:
 			DPrintf("election timer is reset for peer: %d", rf.me)
 		}
 	}
