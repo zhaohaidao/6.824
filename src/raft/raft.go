@@ -209,10 +209,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		if !((rf.getLastLogIndex() >= args.PrevLogIndex) && (args.PrevLogTerm == rf.logs[args.PrevLogIndex].Term)) {
-			if rf.getLastLogIndex() >= args.PrevLogIndex {
-				DPrintf("peer: %d, lastLogIndex: %d, args.PrevLogIndex: %d, lastLogTerm: %d, args.PrevLogTerm: %d, logs: %v, entries: %v",
-					rf.me, rf.getLastLogIndex(), args.PrevLogIndex, rf.logs[args.PrevLogIndex].Term, args.PrevLogTerm, rf.logs, args.Entries)
-			}
 			reply.Success = false
 			break
 		}
@@ -343,7 +339,7 @@ func (rf *Raft) needUpdateCommitIndex(entryIndex int) bool {
 	if entryIndex <= rf.commitIndex {
 		return false
 	} else {
-		count := 0
+		count := 1
 		for index := range rf.matchIndex {
 			if index != rf.me {
 				if rf.matchIndex[index] >= entryIndex && rf.currentTerm == rf.logs[entryIndex].Term {
@@ -372,8 +368,15 @@ type Status struct {
 func (rf *Raft) status() Status {
 	nextIndexCopy := make([]int, len(rf.nextIndex))
 	copy(nextIndexCopy, rf.nextIndex[0:len(rf.nextIndex)])
-	return Status{peers:make([]int, len(rf.peers)), currentTerm:rf.currentTerm, nextIndex:nextIndexCopy,
-	commitIndex:rf.commitIndex, logs:rf.logs, lastLogIndex:rf.getLastLogIndex(), lastLogTerm:rf.getLastLogTerm()}
+	return Status{
+		peers: make([]int, len(rf.peers)),
+		currentTerm: rf.currentTerm,
+		nextIndex: nextIndexCopy,
+		commitIndex: rf.commitIndex,
+		logs: rf.logs,
+		lastLogIndex: rf.getLastLogIndex(),
+		lastLogTerm: rf.getLastLogTerm(),
+	}
 }
 
 func (rf *Raft) append(command interface{}) {
@@ -430,8 +433,6 @@ func (rf *Raft) makeAppendEntriesArgs(status Status) map[int]*AppendEntriesArgs 
 			nextIndex := status.nextIndex[index]
 			prevLogIndex := nextIndex - 1
 			entries := rf.getEntries(status.logs, status.nextIndex[index])
-			DPrintf("makeAppendEntriesArgs: peer: %d, nextIndex: %d, prevLogIndex: %d, entries: %v",
-				index, nextIndex, prevLogIndex, entries)
 			argsMap[index] = &AppendEntriesArgs{Term: status.currentTerm, PrevLogIndex: prevLogIndex,
 				PrevLogTerm: status.logs[prevLogIndex].Term, Entries: entries, LeaderCommit: status.commitIndex}
 		}
@@ -467,6 +468,9 @@ func (rf *Raft) sendAppendEntriesAsync(ctx context.Context, peerIndex int, statu
 func (rf *Raft) replicate(ctx context.Context, command interface{}, newCommitIndex chan int) {
 	DPrintf("peer %d start to replicate", rf.me)
 	rf.mu.Lock()
+	if rf.actor != Leader {
+		return
+	}
 	if command != nil {
 		rf.append(command)
 	}
@@ -513,9 +517,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	//// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//// Your code here (2B).
 	if rf.actor == Leader {
 		rf.append(command)
 		index = rf.getLastLogIndex()
@@ -695,7 +699,6 @@ func (rf *Raft) candidateHandler() {
 func (rf *Raft) leaderHandler() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//rf.append("no-op")
 	for index := 0; index < len(rf.peers); index++ {
 		rf.nextIndex[index] = rf.getLastLogIndex() + 1
 		rf.matchIndex[index] = 0
@@ -785,8 +788,7 @@ func (rf *Raft) electWithTimeout(timeout time.Duration) error {
 }
 
 func (rf *Raft) heartbeat() {
-	size := int64(len(rf.peers))
-	timeout := time.Duration((size - 1) * HeartBeatInterval) * time.Millisecond
+	timeout := time.Duration(HeartBeatInterval) * time.Millisecond
 	for {
 		if rf.isLeader() {
 			elapse := rf.replicateWithTimeout(timeout, nil, nil)
