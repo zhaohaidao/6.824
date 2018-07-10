@@ -311,12 +311,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
 
-func (rf *Raft) requestVoteReplyHandler(currentTerm int, reply RequestVoteReply, biggerTerm chan int,
+func (rf *Raft) handleVoteReply(currentTerm int, reply RequestVoteReply, biggerTerm chan int,
 	majority chan bool, count *SuccessCount) {
 	if reply.Term > currentTerm {
 		biggerTerm <- reply.Term
@@ -328,11 +324,6 @@ func (rf *Raft) requestVoteReplyHandler(currentTerm int, reply RequestVoteReply,
 			majority <- true
 		}
 	}
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
 }
 
 func (rf *Raft) needUpdateCommitIndex(entryIndex int) bool {
@@ -440,8 +431,8 @@ func (rf *Raft) makeAppendEntriesArgs(status Status) map[int]*AppendEntriesArgs 
 	return argsMap
 }
 
-func (rf *Raft) sendAppendEntriesAsync(ctx context.Context, peerIndex int, status Status, args *AppendEntriesArgs,
-	waitGroup *sync.WaitGroup) {
+func (rf *Raft) sendAppendEntries(ctx context.Context, peerIndex int, status Status, peers []*labrpc.ClientEnd,
+	args *AppendEntriesArgs, waitGroup *sync.WaitGroup) {
 	defer waitGroup.Done()
 	rpcOk := make(chan bool)
 	reply := &AppendEntriesReply{}
@@ -449,7 +440,7 @@ func (rf *Raft) sendAppendEntriesAsync(ctx context.Context, peerIndex int, statu
 		start := time.Now()
 		DPrintf("peer replicate from %d to %d start. prevLogIndex: %d, nextIndex: %d, start: %s",
 			rf.me, peerIndex, args.PrevLogIndex, args.PrevLogIndex + 1, start)
-		ok := rf.sendAppendEntries(peerIndex, args, reply)
+		ok := peers[peerIndex].Call("Raft.AppendEntries", args, reply)
 		DPrintf("replicate from %d to %d. isOk: %v, success: %v, Term: %d, currentTerm: %d, start: %s, cost: %s",
 			rf.me, peerIndex, ok, reply.Success, reply.Term, status.currentTerm, start, time.Since(start))
 		rpcOk <- ok
@@ -476,6 +467,7 @@ func (rf *Raft) replicate(ctx context.Context, command interface{}, newCommitInd
 	}
 	status := rf.status()
 	argsMap := rf.makeAppendEntriesArgs(status)
+	peers := rf.peers
 	rf.mu.Unlock()
 	var wg sync.WaitGroup
 	done := make(chan bool)
@@ -483,7 +475,7 @@ func (rf *Raft) replicate(ctx context.Context, command interface{}, newCommitInd
 		if index != rf.me {
 			wg.Add(1)
 			innerCtx, _ := context.WithCancel(ctx)
-			go rf.sendAppendEntriesAsync(innerCtx, index, status, argsMap[index], &wg)
+			go rf.sendAppendEntries(innerCtx, index, status, peers, argsMap[index], &wg)
 		}
 	}
 	go func() {
@@ -647,7 +639,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 
-	go rf.stateChangeHandler()
+	go rf.handleStateChange()
 	rf.convert2State(Follower)
 
 	// initialize from state persisted before a crash
@@ -655,7 +647,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) stateChangeHandler() {
+func (rf *Raft) handleStateChange() {
 	for {
 		select {
 		case newActor := <- rf.changedActor:
@@ -727,6 +719,7 @@ func (rf *Raft) followerHandler() {
 func (rf *Raft) elect(ctx context.Context) error {
 	rf.mu.Lock()
 	status := rf.status()
+	peers := rf.peers
 	votedFor := rf.me
 	rf.mu.Unlock()
 	majorityVote := make(chan bool)
@@ -741,12 +734,12 @@ func (rf *Raft) elect(ctx context.Context) error {
 			go func(index int, innerContext context.Context, voteReply *RequestVoteReply) {
 				done := make(chan bool)
 				go func() {
-					done <- rf.sendRequestVote(index, args, voteReply)
+					done <- peers[index].Call("Raft.RequestVote", args, reply)
 				}()
 				select {
 				case ok := <- done:
 					if ok {
-						rf.requestVoteReplyHandler(status.currentTerm, *voteReply, biggerTerm, majorityVote, grantedCount)
+						rf.handleVoteReply(status.currentTerm, *voteReply, biggerTerm, majorityVote, grantedCount)
 					}
 				case <- innerContext.Done():
 					return
