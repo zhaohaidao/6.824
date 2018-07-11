@@ -343,8 +343,9 @@ func (rf *Raft) mayCommit(entryIndex int) bool {
 	}
 }
 
-type Status struct {
-	peers       []int
+type Mirror struct {
+	me          int
+	peers       []*labrpc.ClientEnd
 	currentTerm int
 	nextIndex   []int
 	commitIndex int
@@ -353,18 +354,18 @@ type Status struct {
 	lastLogTerm  int
 }
 
-
-func (rf *Raft) status() Status {
+func (rf *Raft) mirror() Mirror {
 	nextIndexCopy := make([]int, len(rf.nextIndex))
 	copy(nextIndexCopy, rf.nextIndex[0:len(rf.nextIndex)])
-	return Status{
-		peers: make([]int, len(rf.peers)),
-		currentTerm: rf.currentTerm,
-		nextIndex: nextIndexCopy,
-		commitIndex: rf.commitIndex,
-		logs: rf.logs,
+	return Mirror{
+		me:           rf.me,
+		peers:        rf.peers,
+		currentTerm:  rf.currentTerm,
+		nextIndex:    nextIndexCopy,
+		commitIndex:  rf.commitIndex,
+		logs:         rf.logs,
 		lastLogIndex: rf.getLastLogIndex(),
-		lastLogTerm: rf.getLastLogTerm(),
+		lastLogTerm:  rf.getLastLogTerm(),
 	}
 }
 
@@ -372,23 +373,14 @@ func (rf *Raft) append(command interface{}) {
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm, Command: command})
 }
 
-// if lastLogIndex >= nextIndex for a follower, this lastLogIndex can be know only after heartbeat
-// upon election, initial heartbeat does not contain entries
-func (rf *Raft) getEntries(logs []Log, nextIndex int) []Log {
-	if rf.getLastLogIndex() >= nextIndex {
-		return logs[nextIndex:]
-	} else {
-		return nil
-	}
-}
 
-func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, status Status, entries []Log) {
+func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, entries []Log) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.actor != Leader {
 		return
 	}
-	if reply.Term > status.currentTerm {
+	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		if rf.actor != Follower {
 			rf.convert2State(Follower)
@@ -396,10 +388,10 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, s
 		return
 	}
 	if !reply.Success {
-		rf.nextIndex[index] = status.nextIndex[index] - 1
+		rf.nextIndex[index] = rf.nextIndex[index] - 1
 		return
 	} else {
-		nextIndex := status.nextIndex[index]
+		nextIndex := rf.nextIndex[index]
 		prevLogIndex := nextIndex - 1
 		if rf.getLastLogIndex() >= nextIndex {
 			newIndex := prevLogIndex + len(entries)
@@ -415,84 +407,58 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, s
 	}
 }
 
-func (rf *Raft) makeAppendEntriesArgs(status Status) map[int]*AppendEntriesArgs {
+func makeAppendEntriesArgs(mirror Mirror) map[int]*AppendEntriesArgs {
+	// if lastLogIndex >= nextIndex for a follower, this lastLogIndex can be know only after heartbeat
+	// upon election, initial heartbeat does not contain entries
+	getEntries := func(nextIndex int) []Log {
+		if mirror.lastLogIndex >= nextIndex {
+			return mirror.logs[nextIndex:]
+		} else {
+			return nil
+		}
+	}
 	argsMap := make(map[int]*AppendEntriesArgs)
-	for index := 0; index < len(status.peers); index++ {
-		if index != rf.me {
-			nextIndex := status.nextIndex[index]
+	for index := 0; index < len(mirror.peers); index++ {
+		if index != mirror.me {
+			nextIndex := mirror.nextIndex[index]
 			prevLogIndex := nextIndex - 1
-			DPrintf("peer %d . prevLogIndex: %d", rf.me, prevLogIndex)
-			entries := rf.getEntries(status.logs, status.nextIndex[index])
+			DPrintf("peer %d . prevLogIndex: %d", mirror.me, prevLogIndex)
 			argsMap[index] = &AppendEntriesArgs{
-				Term:         status.currentTerm,
+				Term:         mirror.currentTerm,
+				LeaderId:     mirror.me,
 				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  status.logs[prevLogIndex].Term,
-				Entries:      entries,
-				LeaderCommit: status.commitIndex}
+				PrevLogTerm:  mirror.logs[prevLogIndex].Term,
+				Entries:      getEntries(nextIndex),
+				LeaderCommit: mirror.commitIndex}
 		}
 	}
 	return argsMap
 }
 
-func (rf *Raft) sendAppendEntries(ctx context.Context, peerIndex int, status Status, peers []*labrpc.ClientEnd,
-	args *AppendEntriesArgs, waitGroup *sync.WaitGroup) {
-	defer waitGroup.Done()
+func (rf *Raft) sendAppendEntries(peerIndex int, mirror Mirror, args *AppendEntriesArgs) {
+	ctx, cancel := context.WithTimeout(context.Background(), HeartBeatInterval*time.Millisecond)
+	defer cancel()
 	rpcOk := make(chan bool)
 	reply := &AppendEntriesReply{}
 	go func() {
 		start := time.Now()
 		DPrintf("peer replicate from %d to %d start. prevLogIndex: %d, nextIndex: %d, start: %s",
-			rf.me, peerIndex, args.PrevLogIndex, args.PrevLogIndex + 1, start)
-		ok := peers[peerIndex].Call("Raft.AppendEntries", args, reply)
+			args.LeaderId, peerIndex, args.PrevLogIndex, args.PrevLogIndex+1, start)
+		ok := mirror.peers[peerIndex].Call("Raft.AppendEntries", args, reply)
 		DPrintf("replicate from %d to %d. isOk: %v, success: %v, Term: %d, currentTerm: %d, start: %s, cost: %s",
-			rf.me, peerIndex, ok, reply.Success, reply.Term, status.currentTerm, start, time.Since(start))
+			mirror.me, peerIndex, ok, reply.Success, reply.Term, mirror.currentTerm, start, time.Since(start))
 		rpcOk <- ok
 	}()
 	select {
 	case ok := <-rpcOk:
 		if ok {
-			rf.handleAppendEntriesReply(reply, peerIndex, status, args.Entries)
+			rf.handleAppendEntriesReply(reply, peerIndex, args.Entries)
 		}
-		DPrintf("replicate from %d to %d finished", rf.me, peerIndex)
-	case <- ctx.Done():
-		DPrintf("replicate from %d to %d timeout", rf.me, peerIndex)
+		DPrintf("replicate from %d to %d finished", mirror.me, peerIndex)
+	case <-ctx.Done():
+		DPrintf("replicate from %d to %d timeout", mirror.me, peerIndex)
 	}
 }
-
-func (rf *Raft) replicate(ctx context.Context, command interface{}, newCommitIndex chan int) {
-	DPrintf("peer %d start to replicate", rf.me)
-	rf.mu.Lock()
-	if rf.actor != Leader {
-		return
-	}
-	if command != nil {
-		rf.append(command)
-	}
-	status := rf.status()
-	argsMap := rf.makeAppendEntriesArgs(status)
-	peers := rf.peers
-	rf.mu.Unlock()
-	var wg sync.WaitGroup
-	done := make(chan bool)
-	for index := 0; index < len(status.peers); index++ {
-		if index != rf.me {
-			wg.Add(1)
-			innerCtx, _ := context.WithCancel(ctx)
-			go rf.sendAppendEntries(innerCtx, index, status, peers, argsMap[index], &wg)
-		}
-	}
-	go func() {
-		wg.Wait()
-		done <- true
-	}()
-	select {
-	case <- ctx.Done():
-		DPrintf("replicate timeout for %d", rf.me)
-	case <- done:
-		DPrintf("replicate finished for peer %d", rf.me)
-	}
-}
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -692,18 +658,23 @@ func (rf *Raft) onCandidate() {
 }
 
 func (rf *Raft) leaderInitialize() {
-	for index := 0; index < len(rf.peers); index++ {
-		rf.nextIndex[index] = rf.getLastLogIndex() + 1
-		rf.matchIndex[index] = 0
+	rf.mu.Lock()
+	if rf.actor == Leader {
+		for index := 0; index < len(rf.peers); index++ {
+			rf.nextIndex[index] = rf.getLastLogIndex() + 1
+			rf.matchIndex[index] = 0
+		}
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) onLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.leaderInitialize()
 	//rf.append(0)
-	go rf.heartbeat()
+	rf.leaderInitialize()
+	for rf.isLeader() {
+		go rf.doReplicate(nil)
+		time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
+	}
 }
 
 func (rf *Raft) onFollower() {
@@ -711,7 +682,7 @@ func (rf *Raft) onFollower() {
 		timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
 		select {
 		case <-time.After(timeout):
-			DPrintf("election timer elapse without heartbeat for: %d, timeout: %s",
+			DPrintf("election timer elapse without doReplicate for: %d, timeout: %s",
 				rf.me, timeout)
 			rf.mu.Lock()
 			rf.convert2State(Candidate)
@@ -725,7 +696,7 @@ func (rf *Raft) onFollower() {
 
 func (rf *Raft) elect(ctx context.Context) error {
 	rf.mu.Lock()
-	status := rf.status()
+	status := rf.mirror()
 	peers := rf.peers
 	votedFor := rf.me
 	rf.mu.Unlock()
@@ -787,27 +758,29 @@ func (rf *Raft) electWithTimeout(timeout time.Duration) error {
 	return rf.elect(ctx)
 }
 
-func (rf *Raft) heartbeat() {
-	timeout := time.Duration(HeartBeatInterval) * time.Millisecond
-	for {
-		if rf.isLeader() {
-			elapse := rf.replicateWithTimeout(timeout, nil, nil)
-			if !rf.isLeader() {
-				break
-			}
-			if timeout - elapse > 0 {
-				time.Sleep(timeout - elapse)
-			}
+func (rf *Raft) doReplicate(command interface{}) {
+	prepare := func() (bool, Mirror) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.actor != Leader {
+			return false, Mirror{}
 		} else {
-			break
+			if command != nil {
+				rf.append(command)
+			}
+			return true, rf.mirror()
+		}
+	}
+	if isLeader, mirror := prepare(); isLeader {
+		rf.mu.Lock()
+		argsMap := makeAppendEntriesArgs(mirror)
+		rf.mu.Unlock()
+		for index, args := range argsMap {
+			if index != mirror.me {
+				DPrintf("peer %d start to replicate", mirror.me)
+				go rf.sendAppendEntries(index, mirror, args)
+			}
 		}
 	}
 }
 
-func (rf *Raft) replicateWithTimeout(timeout time.Duration, command interface{}, newCommitIndex chan int) time.Duration {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout))
-	defer cancel()
-	start := time.Now()
-	rf.replicate(ctx, command, newCommitIndex)
-	return time.Since(start)
-}
