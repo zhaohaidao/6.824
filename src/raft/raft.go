@@ -310,16 +310,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 
-func (rf *Raft) handleVoteReply(currentTerm int, reply RequestVoteReply, biggerTerm chan int,
-	majority chan bool, count *SuccessCount) {
-	if reply.Term > currentTerm {
-		biggerTerm <- reply.Term
-		return
-	}
-	if reply.VoteGranted {
-		count.plusOne()
-		if count.get() >= (len(rf.peers)/2 + 1) {
-			majority <- true
+func (rf *Raft) handleVoteReply(currentTerm int, reply RequestVoteReply, count *SuccessCount) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.actor == Candidate {
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.convert2State(Follower)
+			return
+		}
+		if reply.VoteGranted {
+			count.plusOne()
+			if count.get() >= (len(rf.peers)/2 + 1) {
+				rf.convert2State(Leader)
+			}
 		}
 	}
 }
@@ -422,7 +426,6 @@ func makeAppendEntriesArgs(mirror Mirror) map[int]*AppendEntriesArgs {
 		if index != mirror.me {
 			nextIndex := mirror.nextIndex[index]
 			prevLogIndex := nextIndex - 1
-			DPrintf("peer %d . prevLogIndex: %d", mirror.me, prevLogIndex)
 			argsMap[index] = &AppendEntriesArgs{
 				Term:         mirror.currentTerm,
 				LeaderId:     mirror.me,
@@ -632,28 +635,20 @@ func (rf *Raft) handleStateChange() {
 }
 
 func (rf *Raft) candidateInitialize() {
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.actor == Candidate {
+		rf.currentTerm += 1
+		rf.votedFor = rf.me
+	}
 }
 
 func (rf *Raft) onCandidate() {
-	for {
-		if rf.isCandidate() {
-			rf.mu.Lock()
-			rf.candidateInitialize()
-			term := rf.currentTerm
-			rf.mu.Unlock()
-			timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
-			err := rf.electWithTimeout(timeout)
-			if _, ok := err.(*ElectionTimeoutError); ok {
-				DPrintf("peer %d election failed with timeout error. term %d. will start election again", rf.me, term)
-			} else {
-				if err != nil {
-					DPrintf("peer %d election failed with error: %s. term %d reason: %s", rf.me, err.Error(), term)
-				}
-				break
-			}
-		}
+	for rf.isCandidate() {
+		rf.candidateInitialize()
+		timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
+		go rf.elect(timeout)
+		time.Sleep(timeout)
 	}
 }
 
@@ -682,8 +677,7 @@ func (rf *Raft) onFollower() {
 		timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
 		select {
 		case <-time.After(timeout):
-			DPrintf("election timer elapse without doReplicate for: %d, timeout: %s",
-				rf.me, timeout)
+			DPrintf("election timer elapses without heartbeat for: %d, timeout: %s", rf.me, timeout)
 			rf.mu.Lock()
 			rf.convert2State(Candidate)
 			rf.mu.Unlock()
@@ -694,55 +688,46 @@ func (rf *Raft) onFollower() {
 	}
 }
 
-func (rf *Raft) elect(ctx context.Context) error {
-	rf.mu.Lock()
-	status := rf.mirror()
-	peers := rf.peers
-	votedFor := rf.me
-	rf.mu.Unlock()
-	majorityVote := make(chan bool)
-	biggerTerm := make(chan int)
-	grantedCount := &SuccessCount{count:1}
-	args := &RequestVoteArgs{Term: status.currentTerm, CandidateId: votedFor, LastLogIndex: status.lastLogIndex,
-		LastLogTerm: status.lastLogTerm}
-	for index := 0; index < len(status.peers); index++ {
-		if index != rf.me {
-			innerCtx, _ := context.WithCancel(ctx)
-			reply := &RequestVoteReply{}
-			go func(index int, innerContext context.Context, voteReply *RequestVoteReply) {
-				done := make(chan bool)
-				go func() {
-					done <- peers[index].Call("Raft.RequestVote", args, reply)
-				}()
-				select {
-				case ok := <- done:
-					if ok {
-						rf.handleVoteReply(status.currentTerm, *voteReply, biggerTerm, majorityVote, grantedCount)
-					}
-				case <- innerContext.Done():
-					return
-				}
-			}(index, innerCtx, reply)
+func (rf *Raft) elect(timeout time.Duration) {
+	prepare := func() (bool, Mirror) {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.actor != Candidate {
+			return false, Mirror{}
+		} else {
+			return true, rf.mirror()
 		}
 	}
-	select {
-	case <- majorityVote:
-		rf.mu.Lock()
-		if rf.actor == Candidate {
-			rf.convert2State(Leader)
+	if isCandidate, mirror := prepare(); isCandidate {
+		peers := mirror.peers
+		votedFor := mirror.me
+		grantedCount := &SuccessCount{count: 1}
+		args := &RequestVoteArgs{
+			Term:         mirror.currentTerm,
+			CandidateId:  votedFor,
+			LastLogIndex: mirror.lastLogIndex,
+			LastLogTerm:  mirror.lastLogTerm,
 		}
-		rf.mu.Unlock()
-		return nil
-	case <- ctx.Done():
-		return &ElectionTimeoutError{message:fmt.Sprintf("election timeout for peer %d", rf.me)}
-	case term := <- biggerTerm:
-		rf.mu.Lock()
-		if rf.actor != Follower {
-			rf.currentTerm = term
-			rf.convert2State(Follower)
+		for index := 0; index < len(mirror.peers); index++ {
+			if index != mirror.me {
+				ctx, _ := context.WithTimeout(context.Background(), timeout)
+				reply := &RequestVoteReply{}
+				go func(index int, innerContext context.Context, voteReply *RequestVoteReply) {
+					done := make(chan bool)
+					go func() {
+						done <- peers[index].Call("Raft.RequestVote", args, reply)
+					}()
+					select {
+					case ok := <-done:
+						if ok {
+							rf.handleVoteReply(mirror.currentTerm, *voteReply, grantedCount)
+						}
+					case <-innerContext.Done():
+						return
+					}
+				}(index, ctx, reply)
+			}
 		}
-		rf.mu.Unlock()
-		return &StateChangeError{message:fmt.Sprintf("peer %d convert to %s with term %d", rf.me, Follower, term)}
 	}
 }
 
@@ -750,12 +735,6 @@ func (rf *Raft) convert2State(actor string) {
 	DPrintf("peer %d converts to %s with currentTerm %d", rf.me, actor, rf.currentTerm)
 	rf.actor = actor
 	rf.changedActor <- actor
-}
-
-func (rf *Raft) electWithTimeout(timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return rf.elect(ctx)
 }
 
 func (rf *Raft) doReplicate(command interface{}) {
