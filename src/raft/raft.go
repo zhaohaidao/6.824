@@ -24,6 +24,8 @@ import (
 	"math/rand"
 	"context"
 	"fmt"
+	"bytes"
+	"encoding/gob"
 )
 
 // import "bytes"
@@ -132,6 +134,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	buf := new(bytes.Buffer)
+	encoder := gob.NewEncoder(buf)
+	mirror := rf.mirror()
+	encoder.Encode(mirror.currentTerm)
+	encoder.Encode(mirror.votedFor)
+	encoder.Encode(mirror.logs)
+	rf.persister.SaveRaftState(buf.Bytes())
 }
 
 //
@@ -147,6 +156,12 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
 }
 
 //
@@ -172,8 +187,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term int
-	Success bool
+	Term             int
+	SuggestNextIndex int
+	Success          bool
 }
 
 //
@@ -191,6 +207,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	reply.SuggestNextIndex = -1
 	for {
 		if args.Term < rf.currentTerm {
 			reply.Success = false
@@ -198,6 +215,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			if rf.currentTerm != args.Term {
 				rf.currentTerm = args.Term
+				rf.persist()
 			}
 			if rf.actor != Follower {
 				rf.convert2State(Follower)
@@ -206,23 +224,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 
-		if rf.getLastLogIndex() < args.PrevLogIndex || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
+		if rf.getLastLogIndex() < args.PrevLogIndex {
+			reply.SuggestNextIndex = rf.getLastLogIndex() + 1
 			reply.Success = false
 			break
-		}
-		if args.Entries != nil {
-			if rf.getLastLogIndex() == args.PrevLogIndex {
-				rf.logs = append(rf.logs, args.Entries...)
-			} else {
-				for logIndex := args.PrevLogIndex + 1; logIndex <= args.PrevLogIndex + len(args.Entries); logIndex++ {
-					if rf.logs[logIndex].Term != args.Entries[logIndex-args.PrevLogIndex-1].Term {
-						rf.logs = rf.logs[0 : logIndex]
-						rf.logs = append(rf.logs, args.Entries[logIndex-args.PrevLogIndex-1:]...)
+		} else {
+			if args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
+				reply.SuggestNextIndex = func() int {
+					suggestIndex := args.PrevLogIndex
+					conflictTerm := rf.logs[args.PrevLogIndex].Term
+					for index := args.PrevLogIndex - 1; index > 0; index-- {
+						if rf.logs[index].Term != conflictTerm {
+							break
+						} else {
+							suggestIndex = index
+						}
 					}
-
+					return suggestIndex
+				}()
+				reply.Success = false
+				break
+			}
+			if args.Entries != nil {
+				if rf.getLastLogIndex() > args.PrevLogIndex {
+					rf.logs = rf.logs[0 : args.PrevLogIndex+1]
 				}
+				rf.logs = append(rf.logs, args.Entries...)
+				rf.persist()
 			}
 		}
+
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 			rf.newCommitIndexCh <- rf.commitIndex
@@ -230,6 +261,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		break
 	}
+
 }
 
 func min(left int, right int) int {
@@ -256,6 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		} else if args.Term > rf.currentTerm {
 			rf.votedFor = -1
 			rf.currentTerm = args.Term
+			rf.persist()
 			if rf.actor != Follower {
 				rf.convert2State(Follower)
 			}
@@ -275,8 +308,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		break
 	}
+	DPrintf("peer %v vote for %v, VoteGranted: %v, args.LastLogTerm: %v, rf.getLastLogTerm: %v, args.LastLogIndex: %v, rf.getLastLogIndex: %v", rf.me, args.CandidateId, reply.VoteGranted,
+		args.LastLogTerm, rf.getLastLogTerm(), args.LastLogIndex, rf.getLastLogIndex())
 	if reply.VoteGranted == true {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 }
 
@@ -351,6 +387,7 @@ type Mirror struct {
 	me          int
 	peers       []*labrpc.ClientEnd
 	currentTerm int
+	votedFor    int
 	nextIndex   []int
 	commitIndex int
 	logs        []Log
@@ -365,6 +402,7 @@ func (rf *Raft) mirror() Mirror {
 		me:           rf.me,
 		peers:        rf.peers,
 		currentTerm:  rf.currentTerm,
+		votedFor:     rf.votedFor,
 		nextIndex:    nextIndexCopy,
 		commitIndex:  rf.commitIndex,
 		logs:         rf.logs,
@@ -386,13 +424,18 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, e
 	}
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
+		rf.persist()
 		if rf.actor != Follower {
 			rf.convert2State(Follower)
 		}
 		return
 	}
 	if !reply.Success {
-		rf.nextIndex[index] = rf.nextIndex[index] - 1
+		if reply.SuggestNextIndex != -1 {
+			rf.nextIndex[index] = reply.SuggestNextIndex
+		} else {
+			rf.nextIndex[index] = rf.nextIndex[index] - 1
+		}
 		return
 	} else {
 		nextIndex := rf.nextIndex[index]
@@ -402,8 +445,8 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, index int, e
 			rf.nextIndex[index] = newIndex + 1
 			rf.matchIndex[index] = newIndex
 			if rf.mayCommit(newIndex) {
-				DPrintf("peer replicate from %d to %d. commitIndex update from %d to %d",
-					rf.me, index, rf.commitIndex, newIndex)
+				DPrintf("peer replicate from %d to %d. commitIndex update from %d to %d, logs: %v",
+					rf.me, index, rf.commitIndex, newIndex, rf.logs)
 				rf.commitIndex = newIndex
 				rf.newCommitIndexCh <- newIndex
 			}
@@ -445,8 +488,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, mirror Mirror, args *AppendEntr
 	reply := &AppendEntriesReply{}
 	go func() {
 		start := time.Now()
-		DPrintf("peer replicate from %d to %d start. prevLogIndex: %d, nextIndex: %d, start: %s",
-			args.LeaderId, peerIndex, args.PrevLogIndex, args.PrevLogIndex+1, start)
+		DPrintf("peer replicate from %d to %d start. prevLogIndex: %d, nextIndex: %d, start: %s, replicator logs: %v, len: %v",
+			args.LeaderId, peerIndex, args.PrevLogIndex, args.PrevLogIndex+1, start, mirror.logs, len(mirror.logs))
 		ok := mirror.peers[peerIndex].Call("Raft.AppendEntries", args, reply)
 		DPrintf("replicate from %d to %d. isOk: %v, success: %v, Term: %d, currentTerm: %d, start: %s, cost: %s",
 			mirror.me, peerIndex, ok, reply.Success, reply.Term, mirror.currentTerm, start, time.Since(start))
@@ -486,6 +529,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//// Your code here (2B).
 	if rf.actor == Leader {
 		rf.append(command)
+		rf.persist()
 		index = rf.getLastLogIndex()
 		term = rf.getLastLogTerm()
 		isLeader = true
@@ -578,6 +622,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.logs= make([]Log, 1)
 	rf.logs[0].Term = 0
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -614,8 +660,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.handleStateChange()
 	rf.convert2State(Follower)
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 	return rf
 }
 
@@ -640,6 +684,7 @@ func (rf *Raft) candidateInitialize() {
 	if rf.actor == Candidate {
 		rf.currentTerm += 1
 		rf.votedFor = rf.me
+		rf.persist()
 	}
 }
 
@@ -664,8 +709,10 @@ func (rf *Raft) leaderInitialize() {
 }
 
 func (rf *Raft) onLeader() {
-	//rf.append(0)
 	rf.leaderInitialize()
+	// "no-op" leads 2B case failed. so we comment it
+	//go rf.doReplicate(-1)
+	//time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
 	for rf.isLeader() {
 		go rf.doReplicate(nil)
 		time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
@@ -673,6 +720,10 @@ func (rf *Raft) onLeader() {
 }
 
 func (rf *Raft) onFollower() {
+	rf.mu.Lock()
+	rf.votedFor = -1
+	rf.persist()
+	rf.mu.Unlock()
 	for {
 		timeout := time.Duration(randomElectionTimeout()) * time.Millisecond
 		select {
@@ -746,6 +797,7 @@ func (rf *Raft) doReplicate(command interface{}) {
 		} else {
 			if command != nil {
 				rf.append(command)
+				rf.persist()
 			}
 			return true, rf.mirror()
 		}

@@ -7,3 +7,8 @@ src/mapreduce/*.txt
 src/pbservice/*.txt
 src/kvpaxos/*.txt
 src/pbservice/*.out
+src/main/ctx.go
+src/raft/batch.sh
+src/raft/prof.cpu
+src/raft/raft.test
+src/raft/result.txt
