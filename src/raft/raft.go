@@ -104,6 +104,8 @@ type Raft struct {
 	changedActor       chan string
 	resetElectionTimer chan bool
 	newCommitIndexCh   chan int
+
+	StateChangeCh      chan string
 }
 
 // return currentTerm and whether this server
@@ -579,7 +581,7 @@ func (successCount *SuccessCount) get() int {
 	return successCount.count
 }
 
-func (rf *Raft) isLeader() bool {
+func (rf *Raft) IsLeader() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.actor == Leader
@@ -637,6 +639,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetElectionTimer = make(chan bool)
 	rf.changedActor = make(chan string)
 	rf.newCommitIndexCh = make(chan int)
+	rf.StateChangeCh = make(chan string)
 
 	go func() {
 		for {
@@ -667,6 +670,7 @@ func (rf *Raft) handleStateChange() {
 	for {
 		select {
 		case newActor := <- rf.changedActor:
+			rf.StateChangeCh <- newActor
 			if newActor == Leader {
 				go rf.onLeader()
 			} else if newActor == Candidate {
@@ -713,7 +717,7 @@ func (rf *Raft) onLeader() {
 	// "no-op" leads 2B case failed. so we comment it
 	//go rf.doReplicate(-1)
 	//time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
-	for rf.isLeader() {
+	for rf.IsLeader() {
 		go rf.doReplicate(nil)
 		time.Sleep(time.Duration(HeartBeatInterval) * time.Millisecond)
 	}
